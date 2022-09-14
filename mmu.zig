@@ -7,13 +7,13 @@ const GranuleParams = struct {
     lvls_required: TransLvl,
 };
 
+const vaStart: usize = 0xffff000000000000;
+
 pub const Granule = struct {
     pub const Fourk: GranuleParams = .{ .page_size = 4096, .lvls_required = .third_lvl };
     pub const Sixteenk: GranuleParams = .{ .page_size = 16384, .lvls_required = .third_lvl };
     pub const Sixtyfourk: GranuleParams = .{ .page_size = 65536, .lvls_required = .second_lvl };
 };
-
-const vaStart: usize = 0xffff000000000000;
 
 // In addition to an output address, a translation table entry that refers to a page or region of memory
 // includes fields that define properties of the target memory region. These fields can be classified as
@@ -131,10 +131,17 @@ pub const TcrReg = packed struct {
     }
 };
 
-pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
+pub fn PageDir(mapping: Mapping, granule: GranuleParams) !type {
     const page_size = granule.page_size;
-    const table_len = page_size / @sizeOf(usize);
+    const table_len = try std.math.divExact(usize, page_size, @sizeOf(usize));
     const max_lvl = granule.lvls_required;
+    const req_pages = try std.math.divExact(usize, mapping.mem_size, page_size);
+
+    comptime var req_table_total = 0;
+    var ccurr_lvl: usize = 1;
+    while (ccurr_lvl <= @enumToInt(granule.lvls_required) + 1) : (ccurr_lvl += 1) {
+        req_table_total += try std.math.divCeil(usize, req_pages, std.math.pow(usize, table_len, ccurr_lvl));
+    }
     return struct {
         const Self = @This();
         page_size: usize,
@@ -142,14 +149,9 @@ pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
 
         mapping: Mapping,
         max_lvl: TransLvl,
-        map_pg_dir: []volatile [table_len]usize,
-
-        const Error = error{MemSizeTooBig};
+        map_pg_dir: *volatile [req_table_total][table_len]usize,
 
         pub fn init(base_addr: usize) !Self {
-            var map_pg_dir: []volatile [table_len]usize = undefined;
-            map_pg_dir.ptr = @intToPtr([*]volatile [table_len]usize, base_addr);
-            map_pg_dir.len = table_len * page_size;
             return Self{
                 // sizes
                 .page_size = page_size,
@@ -157,7 +159,7 @@ pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
 
                 .max_lvl = max_lvl,
                 .mapping = mapping,
-                .map_pg_dir = map_pg_dir,
+                .map_pg_dir = @intToPtr(*volatile [req_table_total][table_len]usize, base_addr),
             };
         }
 
@@ -165,31 +167,20 @@ pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
             return std.math.pow(usize, self.table_len, @enumToInt(self.max_lvl) - @enumToInt(lvl)) * self.page_size;
         }
 
-        // 1*512*512*4096
-        // 512^(i-1)*4096
         pub fn mapMem(self: *Self) !void {
-            // calc amounts of tables required per lvl
-            var table_entries = [_]usize{0} ** 3;
-            var curr_lvl: usize = 0;
-            const lvl_1 = (TableEntryAttr{ .accessPerm = .read_write, .descType = .block }).asInt();
-
-            while (curr_lvl <= @enumToInt(self.max_lvl)) : (curr_lvl += 1) {
-                table_entries[curr_lvl] = try std.math.divCeil(usize, self.mapping.mem_size, self.calcTransLvlEntrySize(@intToEnum(TransLvl, curr_lvl)));
-            }
-
-            curr_lvl = 0;
+            const lvl_1_attr = (TableEntryAttr{ .accessPerm = .read_write, .descType = .block }).asInt();
             var phys_count = self.mapping.phys_addr | (TableEntryAttr{ .accessPerm = .read_write, .descType = .page }).asInt();
             var pg_dir_offset: usize = 0;
+            var curr_lvl: usize = 0;
             while (curr_lvl <= @enumToInt(self.max_lvl)) : (curr_lvl += 1) {
-                var req_table = (try std.math.divCeil(usize, table_entries[curr_lvl], self.table_len));
-                var req_entry: usize = table_entries[curr_lvl];
+                var req_entry = try std.math.divCeil(usize, self.mapping.mem_size, self.calcTransLvlEntrySize(@intToEnum(TransLvl, curr_lvl)));
+                var req_table = try std.math.divCeil(usize, req_entry, self.table_len);
                 var curr_entry: usize = 0;
                 var curr_table: usize = 0;
+
                 while (curr_table < req_table) : (curr_table += 1) {
                     curr_entry = 0;
-                    if (req_entry > self.table_len)
-                        req_entry -= self.table_len;
-                    while (curr_entry <= self.table_len) : (curr_entry += 1) {
+                    while (curr_entry < req_entry and curr_entry <= self.table_len) : (curr_entry += 1) {
                         // last lvl translation links to physical mem
                         if (curr_lvl == @enumToInt(self.max_lvl)) {
                             self.map_pg_dir[pg_dir_offset + curr_table][curr_entry] = phys_count;
@@ -198,14 +189,23 @@ pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
                         } else {
                             self.map_pg_dir[pg_dir_offset + curr_table][curr_entry] = @ptrToInt(&self.map_pg_dir[pg_dir_offset + req_table + curr_entry]);
                             if (curr_lvl == @enumToInt(TransLvl.first_lvl))
-                                self.map_pg_dir[pg_dir_offset + curr_table][curr_entry] |= lvl_1;
+                                self.map_pg_dir[pg_dir_offset + curr_table][curr_entry] |= lvl_1_attr;
                         }
-                        if (req_entry < self.table_len)
-                            break;
                     }
+                    if (req_entry >= self.table_len)
+                        req_entry -= self.table_len;
                 }
                 pg_dir_offset += req_table;
             }
+            // var i: usize = 0;
+            // var j: usize = 0;
+            // while (i <= 20000000) : (i += 1) {
+            //     j = 0;
+            //     kprint("new table({d}): \n", .{i});
+            //     while (j < self.table_len) : (j += 1) {
+            //         kprint("val: 0x{x} addr: 0x{x} \n", .{ self.map_pg_dir[i][j], @ptrToInt(&self.map_pg_dir[i][j]) });
+            //     }
+            // }
             // kprint("base address: {*} \n", .{self.map_pg_dir.ptr});
             // kprint("1 lvl (1 table entry): {*} 0x{x} \n", .{ &self.map_pg_dir[0][0], self.map_pg_dir[0][0] });
             // kprint("------- \n", .{});
@@ -216,6 +216,7 @@ pub fn PageDir(mapping: Mapping, granule: GranuleParams) type {
             // kprint("3 lvl (3 table base address!): {*} 0x{x} \n", .{ &self.map_pg_dir[2][0], self.map_pg_dir[2][0] });
             // kprint("3 lvl (4 table base address!): {*} 0x{x} \n", .{ &self.map_pg_dir[3][0], self.map_pg_dir[3][0] });
             // kprint("3 lvl (5 table base address!): {*} 0x{x} \n", .{ &self.map_pg_dir[4][0], self.map_pg_dir[4][0] });
+            // kprint("---------------------------- \n", .{});
         }
     };
 }

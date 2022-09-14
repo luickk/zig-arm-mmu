@@ -20,11 +20,9 @@ try mmu.createSection(_ttbr0_dir, bootloader_mapping, mmu.TableEntryAttr{ .acces
 ### Properly Mapped Page Dir
 
 ```zig
-// defining mapping
 const user_mapping = mmu.Mapping{ .mem_size = 0x40000000, .virt_start_addr = 0, .phys_addr = 0x40000000 };
 // initing PageDir with 4k granule at address _u_ttbr0_dir
-var ttbr0 = try mmu.PageDir(user_mapping, mmu.Granule.Fourk).init(_u_ttbr0_dir);
-// actually writing to given address
+var ttbr0 = try (try mmu.PageDir(user_mapping, mmu.Granule.Fourk)).init(_u_ttbr0_dir);
 try ttbr0.mapMem();
 ```
 
